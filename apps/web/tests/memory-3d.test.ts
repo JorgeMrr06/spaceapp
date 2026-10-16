@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { layoutMemoryNetwork3D, memory3DVolumeRatio, projectMemoryPoint, DEFAULT_MEMORY_CAMERA } from "../src/features/memory-workspace/memory-3d.js";
+import { createMemoryNetwork3DLayout, layoutMemoryNetwork3D, memory3DVolumeRatio, memoryNetwork3DLayoutSnapshot, projectMemoryPoint, stepMemoryNetwork3DLayout, DEFAULT_MEMORY_CAMERA } from "../src/features/memory-workspace/memory-3d.js";
+import { decodeMemoryGraphPickColor, MAX_MEMORY_GRAPH_LABELS, MAX_MEMORY_GRAPH_LABEL_MEASUREMENTS, memoryGraphP95, selectMemoryGraphLabels } from "../src/features/memory-workspace/memory-webgl-renderer.js";
 import type { MemoryGraphNode, MemoryGraphEdge } from "@space/contracts";
 
 describe("3D memory projection", () => {
@@ -58,5 +59,39 @@ describe("3D memory projection", () => {
     const plane = Array.from({ length: 100 }, (_, i) => ({ x: i % 10, y: Math.floor(i / 10), z: i % 10 + Math.floor(i / 10) }));
     expect(memory3DVolumeRatio(plane)).toBeCloseTo(0);
     expect(layoutMemoryNetwork3D([], []).size).toBe(0);
+  });
+  it("streams deterministic layout snapshots before converging", () => {
+    const { nodes, edges } = fixture();
+    const state = createMemoryNetwork3DLayout(nodes, edges);
+    const initial = memoryNetwork3DLayoutSnapshot(state);
+    expect(stepMemoryNetwork3DLayout(state, 12)).toBe(false);
+    expect(memoryNetwork3DLayoutSnapshot(state)).not.toEqual(initial);
+    while (!stepMemoryNetwork3DLayout(state, 12)) { /* worker-sized chunks */ }
+    expect(memoryNetwork3DLayoutSnapshot(state)).toEqual(layoutMemoryNetwork3D(nodes, edges));
+  });
+  it("bounds label measurement and drawing independently of graph size", () => {
+    const nodes: MemoryGraphNode[] = Array.from({ length: 5000 }, (_, index) => ({
+      id: `source:${index}`,
+      label: index === 0 ? "gemini.md" : `Source ${index}`,
+      type: "SOURCE",
+      sourcePath: `/memory/${index}.md`,
+      recordId: null
+    }));
+    const coordinates = new Map(nodes.map((node, index) => [node.id, { x: (index % 50) - 25, y: Math.floor(index / 50) - 50, z: index % 7 }]));
+    let measurements = 0;
+    const labels = selectMemoryGraphLabels(nodes, coordinates, DEFAULT_MEMORY_CAMERA, 3, 1200, 800, "source:4999", label => {
+      measurements++;
+      return label.length * 6;
+    });
+    expect(measurements).toBeLessThanOrEqual(MAX_MEMORY_GRAPH_LABEL_MEASUREMENTS);
+    expect(labels.length).toBeLessThanOrEqual(MAX_MEMORY_GRAPH_LABELS);
+    expect(labels.some(label => label.id === "source:4999")).toBe(true);
+  });
+  it("decodes GPU picking colors and reports the nearest-rank p95", () => {
+    expect(decodeMemoryGraphPickColor([0, 0, 0, 0])).toBeNull();
+    expect(decodeMemoryGraphPickColor([1, 0, 0, 255])).toBe(0);
+    expect(decodeMemoryGraphPickColor([0, 1, 0, 255])).toBe(255);
+    expect(memoryGraphP95(Array.from({ length: 100 }, (_, index) => index + 1))).toBe(95);
+    expect(memoryGraphP95([])).toBe(0);
   });
 });
