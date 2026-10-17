@@ -93,6 +93,7 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
     const benchmarkEnabled = queryParameters.get("memoryGraphBenchmark") === "1";
     const benchmarkDurations: number[] = [];
     const benchmarkPickDurations: number[] = [];
+    const benchmarkPickCandidateCounts: number[] = [];
     let benchmarkWarmup = 30;
     let benchmarkNodeCount = 0;
     let benchmarkPhase: "frames" | "picks" = "frames";
@@ -225,6 +226,7 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
           canvas.dataset.graphUploadWindow = `${graphUploadStarted.toFixed(0)}-${performance.now().toFixed(0)}`;
           canvas.dataset.graphUploadMs = renderer.lastGraphUploadDurationMs.toFixed(2);
           canvas.dataset.coordinateUploadMs = renderer.lastCoordinateUploadDurationMs.toFixed(2);
+          canvas.dataset.pickIndexBuildMs = renderer.lastPickIndexBuildDurationMs.toFixed(2);
           if (adjacencyTimer) window.clearTimeout(adjacencyTimer);
           const adjacencyRenderer = renderer;
           const adjacencyNodes = graph.nodes;
@@ -244,6 +246,7 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
         } else if (graphCoordinates !== graph.coordinates) {
           renderer.updateCoordinates(graph.coordinates);
           canvas.dataset.coordinateUploadMs = renderer.lastCoordinateUploadDurationMs.toFixed(2);
+          canvas.dataset.pickIndexBuildMs = renderer.lastPickIndexBuildDurationMs.toFixed(2);
         }
         graphCoordinates = graph.coordinates;
         scale = Math.min(width, height) * 0.4 / renderer.extent;
@@ -295,6 +298,7 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
         benchmarkNodeCount = graph.nodes.length;
         benchmarkDurations.length = 0;
         benchmarkPickDurations.length = 0;
+        benchmarkPickCandidateCounts.length = 0;
         benchmarkWarmup = 30;
         benchmarkPhase = "frames";
         canvas.dataset.benchmarkState = "waiting";
@@ -313,12 +317,16 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
         cameraRef.current.yaw += 0.004;
         renderer.pick(x, y, cameraRef.current, scale);
         benchmarkPickDurations.push(renderer.lastPickDurationMs);
+        benchmarkPickCandidateCounts.push(renderer.lastPickCandidateClusters);
         if (benchmarkPickDurations.length >= 20) {
           canvas.dataset.benchmarkState = "complete";
           canvas.dataset.frameP95Ms = memoryGraphP95(benchmarkDurations).toFixed(2);
           canvas.dataset.frameSamples = String(benchmarkDurations.length);
           canvas.dataset.pickP95Ms = memoryGraphP95(benchmarkPickDurations).toFixed(2);
+          canvas.dataset.pickMaxMs = Math.max(...benchmarkPickDurations).toFixed(2);
+          canvas.dataset.pickMetric = "clustered-cpu-projection";
           canvas.dataset.pickSamples = String(benchmarkPickDurations.length);
+          canvas.dataset.pickCandidateClustersMax = String(Math.max(...benchmarkPickCandidateCounts));
           canvas.dataset.longTaskMaxMs = longestLongTask.toFixed(2);
           canvas.dataset.longTaskCount = String(longTaskCount);
           canvas.dispatchEvent(new CustomEvent("memorygraphbenchmarkcomplete", { bubbles: true }));

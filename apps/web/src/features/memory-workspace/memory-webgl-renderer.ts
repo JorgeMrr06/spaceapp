@@ -5,6 +5,7 @@ import { projectMemoryPoint, type MemoryCamera3D, type MemoryPoint3D } from "./m
 
 export const MAX_MEMORY_GRAPH_LABELS = 160;
 export const MAX_MEMORY_GRAPH_LABEL_MEASUREMENTS = 256;
+const PICK_CLUSTER_AXIS = 4;
 
 export function memoryGraphP95(samples: number[]): number {
   if (samples.length === 0) return 0;
@@ -12,9 +13,146 @@ export function memoryGraphP95(samples: number[]): number {
   return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1)]!;
 }
 
-export function decodeMemoryGraphPickColor(pixel: ArrayLike<number>): number | null {
-  const encoded = (pixel[0] ?? 0) + ((pixel[1] ?? 0) << 8) + ((pixel[2] ?? 0) << 16);
-  return encoded > 0 ? encoded - 1 : null;
+export type MemoryGraphPickIndex = {
+  offsets: Uint32Array;
+  bounds: Float32Array;
+  maxSizes: Float32Array;
+  nodeIndices: Uint32Array;
+};
+
+export function buildMemoryGraphPickIndex(
+  nodePositions: Float32Array,
+  nodeSizes: Float32Array,
+  axis = PICK_CLUSTER_AXIS
+): MemoryGraphPickIndex {
+  const clusterCount = axis ** 3;
+  const nodeCount = nodeSizes.length;
+  const offsets = new Uint32Array(clusterCount + 1);
+  const bounds = new Float32Array(clusterCount * 6);
+  const maxSizes = new Float32Array(clusterCount);
+  for (let cluster = 0; cluster < clusterCount; cluster++) {
+    const offset = cluster * 6;
+    bounds[offset] = bounds[offset + 1] = bounds[offset + 2] = Number.POSITIVE_INFINITY;
+    bounds[offset + 3] = bounds[offset + 4] = bounds[offset + 5] = Number.NEGATIVE_INFINITY;
+  }
+  if (nodeCount === 0) return { offsets, bounds, maxSizes, nodeIndices: new Uint32Array() };
+
+  let minX = Number.POSITIVE_INFINITY, minY = Number.POSITIVE_INFINITY, minZ = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY, maxY = Number.NEGATIVE_INFINITY, maxZ = Number.NEGATIVE_INFINITY;
+  for (let index = 0; index < nodeCount; index++) {
+    const positionOffset = index * 3;
+    const x = nodePositions[positionOffset]!;
+    const y = nodePositions[positionOffset + 1]!;
+    const z = nodePositions[positionOffset + 2]!;
+    minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+    minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
+  }
+  const spanX = Math.max(1e-6, maxX - minX);
+  const spanY = Math.max(1e-6, maxY - minY);
+  const spanZ = Math.max(1e-6, maxZ - minZ);
+  const counts = new Uint32Array(clusterCount);
+  const clusterByNode = new Uint32Array(nodeCount);
+  for (let index = 0; index < nodeCount; index++) {
+    const positionOffset = index * 3;
+    const x = nodePositions[positionOffset]!;
+    const y = nodePositions[positionOffset + 1]!;
+    const z = nodePositions[positionOffset + 2]!;
+    const cellX = Math.min(axis - 1, Math.floor((x - minX) / spanX * axis));
+    const cellY = Math.min(axis - 1, Math.floor((y - minY) / spanY * axis));
+    const cellZ = Math.min(axis - 1, Math.floor((z - minZ) / spanZ * axis));
+    const cluster = cellX + cellY * axis + cellZ * axis * axis;
+    clusterByNode[index] = cluster;
+    counts[cluster] = counts[cluster]! + 1;
+    const boundOffset = cluster * 6;
+    bounds[boundOffset] = Math.min(bounds[boundOffset]!, x);
+    bounds[boundOffset + 1] = Math.min(bounds[boundOffset + 1]!, y);
+    bounds[boundOffset + 2] = Math.min(bounds[boundOffset + 2]!, z);
+    bounds[boundOffset + 3] = Math.max(bounds[boundOffset + 3]!, x);
+    bounds[boundOffset + 4] = Math.max(bounds[boundOffset + 4]!, y);
+    bounds[boundOffset + 5] = Math.max(bounds[boundOffset + 5]!, z);
+    maxSizes[cluster] = Math.max(maxSizes[cluster]!, nodeSizes[index]!);
+  }
+  for (let cluster = 0; cluster < clusterCount; cluster++) offsets[cluster + 1] = offsets[cluster]! + counts[cluster]!;
+  const cursors = offsets.slice(0, clusterCount);
+  const nodeIndices = new Uint32Array(nodeCount);
+  for (let index = 0; index < nodeCount; index++) {
+    const cluster = clusterByNode[index]!;
+    const destination = cursors[cluster]!;
+    cursors[cluster] = destination + 1;
+    nodeIndices[destination] = index;
+  }
+  return { offsets, bounds, maxSizes, nodeIndices };
+}
+
+export function pickMemoryGraphNodeIndex(
+  pickIndex: MemoryGraphPickIndex,
+  nodePositions: Float32Array,
+  nodeSizes: Float32Array,
+  x: number,
+  y: number,
+  camera: MemoryCamera3D,
+  scale: number,
+  width: number,
+  height: number
+): { nodeIndex: number; candidateClusters: number } {
+  const cy = Math.cos(camera.yaw), sy = Math.sin(camera.yaw);
+  const cp = Math.cos(camera.pitch), sp = Math.sin(camera.pitch);
+  const sqrtZoom = Math.sqrt(camera.zoom);
+  let candidateClusters = 0;
+  let selectedIndex = -1;
+  let selectedDepth = Number.POSITIVE_INFINITY;
+  for (let cluster = 0; cluster < pickIndex.offsets.length - 1; cluster++) {
+    const first = pickIndex.offsets[cluster]!;
+    const last = pickIndex.offsets[cluster + 1]!;
+    if (first === last) continue;
+    const boundOffset = cluster * 6;
+    let minScreenX = Number.POSITIVE_INFINITY, minScreenY = Number.POSITIVE_INFINITY;
+    let maxScreenX = Number.NEGATIVE_INFINITY, maxScreenY = Number.NEGATIVE_INFINITY;
+    let maxPerspective = 0;
+    for (let corner = 0; corner < 8; corner++) {
+      const px = pickIndex.bounds[boundOffset + ((corner & 1) === 0 ? 0 : 3)]!;
+      const py = pickIndex.bounds[boundOffset + ((corner & 2) === 0 ? 1 : 4)]!;
+      const pz = pickIndex.bounds[boundOffset + ((corner & 4) === 0 ? 2 : 5)]!;
+      const rotatedX = px * cy + pz * sy;
+      const depth = -px * sy + pz * cy;
+      const rotatedY = py * cp - depth * sp;
+      const projectedZ = py * sp + depth * cp;
+      const perspective = 650 / Math.max(120, 650 + projectedZ * scale);
+      const screenX = width * 0.5 + rotatedX * scale * camera.zoom * perspective;
+      const screenY = height * 0.5 - rotatedY * scale * camera.zoom * perspective;
+      minScreenX = Math.min(minScreenX, screenX); maxScreenX = Math.max(maxScreenX, screenX);
+      minScreenY = Math.min(minScreenY, screenY); maxScreenY = Math.max(maxScreenY, screenY);
+      maxPerspective = Math.max(maxPerspective, perspective);
+    }
+    const radius = Math.max(7, pickIndex.maxSizes[cluster]! * maxPerspective * sqrtZoom + 3);
+    if (x < minScreenX - radius || x > maxScreenX + radius || y < minScreenY - radius || y > maxScreenY + radius) continue;
+    candidateClusters++;
+    for (let sortedIndex = first; sortedIndex < last; sortedIndex++) {
+      const index = pickIndex.nodeIndices[sortedIndex]!;
+      const positionOffset = index * 3;
+      const px = nodePositions[positionOffset]!;
+      const py = nodePositions[positionOffset + 1]!;
+      const pz = nodePositions[positionOffset + 2]!;
+      const rotatedX = px * cy + pz * sy;
+      const depth = -px * sy + pz * cy;
+      const rotatedY = py * cp - depth * sp;
+      const projectedZ = py * sp + depth * cp;
+      const perspective = 650 / Math.max(120, 650 + projectedZ * scale);
+      const screenX = width * 0.5 + rotatedX * scale * camera.zoom * perspective;
+      const screenY = height * 0.5 - rotatedY * scale * camera.zoom * perspective;
+      const nodeRadius = Math.max(7, Math.max(1, nodeSizes[index]! * perspective * sqrtZoom) + 3);
+      const deltaX = x - screenX;
+      const deltaY = y - screenY;
+      if (deltaX * deltaX + deltaY * deltaY > nodeRadius * nodeRadius) continue;
+      const normalizedDepth = Math.max(-0.95, Math.min(0.95, projectedZ * scale / 1000));
+      if (normalizedDepth < selectedDepth || (normalizedDepth === selectedDepth && index > selectedIndex)) {
+        selectedIndex = index;
+        selectedDepth = normalizedDepth;
+      }
+    }
+  }
+  return { nodeIndex: selectedIndex, candidateClusters };
 }
 
 export type MemoryGraphLabel = {
@@ -155,41 +293,6 @@ in vec4 vColor;
 out vec4 outColor;
 void main() { outColor = vColor; }`;
 
-const PICK_VERTEX = `#version 300 es
-precision highp float;
-layout(location=0) in vec2 aCorner;
-layout(location=1) in vec3 aPosition;
-layout(location=3) in float aSize;
-uniform vec2 uViewport;
-uniform vec4 uCamera;
-out vec2 vLocal;
-flat out uint vId;
-void main() {
-  float cy = cos(uCamera.x), sy = sin(uCamera.x);
-  float cp = cos(uCamera.y), sp = sin(uCamera.y);
-  float rotatedX = aPosition.x * cy + aPosition.z * sy;
-  float depth = -aPosition.x * sy + aPosition.z * cy;
-  float rotatedY = aPosition.y * cp - depth * sp;
-  float z = aPosition.y * sp + depth * cp;
-  float perspective = 650.0 / max(120.0, 650.0 + z * uCamera.w);
-  vec2 screen = vec2(uViewport.x * 0.5 + rotatedX * uCamera.w * uCamera.z * perspective, uViewport.y * 0.5 - rotatedY * uCamera.w * uCamera.z * perspective);
-  vec2 clip = vec2(screen.x / uViewport.x * 2.0 - 1.0, 1.0 - screen.y / uViewport.y * 2.0);
-  float radius = max(7.0, max(1.0, aSize * perspective * sqrt(uCamera.z)) + 3.0);
-  gl_Position = vec4(clip + aCorner * radius * 2.0 / uViewport, clamp(z * uCamera.w / 1000.0, -0.95, 0.95), 1.0);
-  vLocal = aCorner;
-  vId = uint(gl_InstanceID + 1);
-}`;
-
-const PICK_FRAGMENT = `#version 300 es
-precision highp float;
-in vec2 vLocal;
-flat in uint vId;
-out vec4 outColor;
-void main() {
-  if (length(vLocal) > 1.0) discard;
-  outColor = vec4(float(vId & 255u), float((vId >> 8u) & 255u), float((vId >> 16u) & 255u), 255.0) / 255.0;
-}`;
-
 function compileProgram(gl: WebGL2RenderingContext, vertexSource: string, fragmentSource: string): WebGLProgram {
   const compile = (type: number, source: string) => {
     const shader = gl.createShader(type);
@@ -232,7 +335,6 @@ export class MemoryGraphWebGLRenderer {
   readonly gl: WebGL2RenderingContext;
   private readonly nodeProgram: WebGLProgram;
   private readonly edgeProgram: WebGLProgram;
-  private readonly pickProgram: WebGLProgram;
   private readonly nodeVao: WebGLVertexArrayObject;
   private readonly edgeChunks: Array<{ vao: WebGLVertexArrayObject; positionBuffer: WebGLBuffer; endpointBuffer: WebGLBuffer; vertexCount: number }>;
   private readonly buffers: WebGLBuffer[] = [];
@@ -240,9 +342,6 @@ export class MemoryGraphWebGLRenderer {
   private readonly colorBuffer: WebGLBuffer;
   private readonly sizeBuffer: WebGLBuffer;
   private readonly stateBuffer: WebGLBuffer;
-  private readonly pickFramebuffer: WebGLFramebuffer;
-  private readonly pickColor: WebGLRenderbuffer;
-  private readonly pickDepth: WebGLRenderbuffer;
   private nodes: MemoryGraphNode[] = [];
   private edges: MemoryGraphEdge[] = [];
   private nodeIds: string[] = [];
@@ -250,20 +349,22 @@ export class MemoryGraphWebGLRenderer {
   private neighborOffsets = new Uint32Array();
   private neighborIndices = new Uint32Array();
   private nodeState = new Float32Array();
+  private nodeSizes = new Float32Array();
   private nodePositions = new Float32Array();
   private edgePositions = new Float32Array();
   private edgeNodeIndices = new Uint32Array();
   private nodeCount = 0;
+  private pickIndex = buildMemoryGraphPickIndex(new Float32Array(), new Float32Array());
   private focusIndex = -1;
-  private readonly pickPixels = new Uint8Array(4);
   private cssWidth = 1;
   private cssHeight = 1;
-  private dpr = 1;
   extent = 60;
   lastPickDurationMs = 0;
   lastGraphUploadDurationMs = 0;
   lastCoordinateUploadDurationMs = 0;
   lastAdjacencyBuildDurationMs = 0;
+  lastPickIndexBuildDurationMs = 0;
+  lastPickCandidateClusters = 0;
 
   constructor(readonly canvas: HTMLCanvasElement) {
     const gl = canvas.getContext("webgl2", { antialias: true, alpha: true, depth: true, powerPreference: "high-performance" });
@@ -275,7 +376,6 @@ export class MemoryGraphWebGLRenderer {
       : gl.getParameter(gl.RENDERER));
     this.nodeProgram = compileProgram(gl, NODE_VERTEX, NODE_FRAGMENT);
     this.edgeProgram = compileProgram(gl, EDGE_VERTEX, EDGE_FRAGMENT);
-    this.pickProgram = compileProgram(gl, PICK_VERTEX, PICK_FRAGMENT);
     const buffer = () => {
       const value = gl.createBuffer();
       if (!value) throw new Error("WebGL buffer allocation failed.");
@@ -310,14 +410,6 @@ export class MemoryGraphWebGLRenderer {
       return { vao, positionBuffer, endpointBuffer, vertexCount: 0 };
     });
     gl.bindVertexArray(null);
-
-    const pickFramebuffer = gl.createFramebuffer();
-    const pickColor = gl.createRenderbuffer();
-    const pickDepth = gl.createRenderbuffer();
-    if (!pickFramebuffer || !pickColor || !pickDepth) throw new Error("WebGL picking allocation failed.");
-    this.pickFramebuffer = pickFramebuffer;
-    this.pickColor = pickColor;
-    this.pickDepth = pickDepth;
   }
 
   private attribute(buffer: WebGLBuffer, location: number, size: number, divisor: number) {
@@ -329,22 +421,12 @@ export class MemoryGraphWebGLRenderer {
   }
 
   resize(width: number, height: number, dpr: number) {
-    const gl = this.gl;
     this.cssWidth = Math.max(1, width);
     this.cssHeight = Math.max(1, height);
-    this.dpr = Math.max(1, dpr);
-    const pixelWidth = Math.max(1, Math.round(width * this.dpr));
-    const pixelHeight = Math.max(1, Math.round(height * this.dpr));
+    const pixelWidth = Math.max(1, Math.round(width * Math.max(1, dpr)));
+    const pixelHeight = Math.max(1, Math.round(height * Math.max(1, dpr)));
     if (this.canvas.width !== pixelWidth) this.canvas.width = pixelWidth;
     if (this.canvas.height !== pixelHeight) this.canvas.height = pixelHeight;
-    gl.bindRenderbuffer(gl.RENDERBUFFER, this.pickColor);
-    gl.renderbufferStorage(gl.RENDERBUFFER, gl.RGBA8, pixelWidth, pixelHeight);
-    gl.bindRenderbuffer(gl.RENDERBUFFER, this.pickDepth);
-    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, pixelWidth, pixelHeight);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.pickFramebuffer);
-    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, this.pickColor);
-    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, this.pickDepth);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
   setGraph(nodes: MemoryGraphNode[], edges: MemoryGraphEdge[], positions: Map<string, MemoryAtlasPosition>, coordinates: Map<string, MemoryPoint3D>) {
@@ -373,7 +455,7 @@ export class MemoryGraphWebGLRenderer {
     this.neighborIndices = new Uint32Array();
     this.nodePositions = new Float32Array(this.nodeCount * 3);
     const nodeColors = new Float32Array(this.nodeCount * 4);
-    const nodeSizes = new Float32Array(this.nodeCount);
+    this.nodeSizes = new Float32Array(this.nodeCount);
     this.nodeState = new Float32Array(this.nodeCount * 2);
     const colorCache = new Map<string, [number, number, number, number]>();
     this.nodes.forEach((node, index) => {
@@ -385,7 +467,7 @@ export class MemoryGraphWebGLRenderer {
       }
       nodeColors.set(color, index * 4);
       const root = node.type === "SOURCE" && isMemoryCoreLabel(node.label);
-      nodeSizes[index] = root ? 10 : node.type === "SOURCE" ? 4.6 : 2.1;
+      this.nodeSizes[index] = root ? 10 : node.type === "SOURCE" ? 4.6 : 2.1;
       this.nodeState.set([1, 1], index * 2);
     });
     this.edgePositions = new Float32Array(this.edges.length * 6);
@@ -400,7 +482,7 @@ export class MemoryGraphWebGLRenderer {
       gl.bufferData(gl.ARRAY_BUFFER, data, usage);
     };
     upload(this.colorBuffer, nodeColors, gl.STATIC_DRAW);
-    upload(this.sizeBuffer, nodeSizes, gl.STATIC_DRAW);
+    upload(this.sizeBuffer, this.nodeSizes, gl.STATIC_DRAW);
     upload(this.stateBuffer, this.nodeState, gl.DYNAMIC_DRAW);
     this.edgeChunks.forEach((chunk, chunkIndex) => {
       const firstEdge = Math.floor(this.edges.length * chunkIndex / this.edgeChunks.length);
@@ -471,7 +553,14 @@ export class MemoryGraphWebGLRenderer {
       gl.bindBuffer(gl.ARRAY_BUFFER, chunk.positionBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, this.edgePositions.subarray(firstEdge * 6, lastEdge * 6), gl.DYNAMIC_DRAW);
     });
+    this.rebuildPickClusters();
     this.lastCoordinateUploadDurationMs = performance.now() - started;
+  }
+
+  private rebuildPickClusters() {
+    const started = performance.now();
+    this.pickIndex = buildMemoryGraphPickIndex(this.nodePositions, this.nodeSizes);
+    this.lastPickIndexBuildDurationMs = performance.now() - started;
   }
 
   setFocus(focus: string | null) {
@@ -546,27 +635,10 @@ export class MemoryGraphWebGLRenderer {
 
   pick(x: number, y: number, camera: MemoryCamera3D, scale: number): string | null {
     const started = performance.now();
-    const gl = this.gl;
-    const pixelX = Math.max(0, Math.min(this.canvas.width - 1, Math.floor(x * this.dpr)));
-    const pixelY = Math.max(0, Math.min(this.canvas.height - 1, this.canvas.height - Math.floor(y * this.dpr) - 1));
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.pickFramebuffer);
-    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-    gl.enable(gl.SCISSOR_TEST);
-    gl.scissor(pixelX, pixelY, 1, 1);
-    gl.enable(gl.DEPTH_TEST);
-    gl.disable(gl.BLEND);
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    this.uniforms(this.pickProgram, camera, scale);
-    gl.bindVertexArray(this.nodeVao);
-    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.nodeCount);
-    gl.readPixels(pixelX, pixelY, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, this.pickPixels);
-    gl.bindVertexArray(null);
-    gl.disable(gl.SCISSOR_TEST);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    const result = pickMemoryGraphNodeIndex(this.pickIndex, this.nodePositions, this.nodeSizes, x, y, camera, scale, this.cssWidth, this.cssHeight);
+    this.lastPickCandidateClusters = result.candidateClusters;
     this.lastPickDurationMs = performance.now() - started;
-    const index = decodeMemoryGraphPickColor(this.pickPixels);
-    return index === null ? null : this.nodeIds[index] ?? null;
+    return result.nodeIndex < 0 ? null : this.nodeIds[result.nodeIndex] ?? null;
   }
 
   destroy() {
@@ -576,10 +648,6 @@ export class MemoryGraphWebGLRenderer {
     this.edgeChunks.forEach(chunk => gl.deleteVertexArray(chunk.vao));
     gl.deleteProgram(this.nodeProgram);
     gl.deleteProgram(this.edgeProgram);
-    gl.deleteProgram(this.pickProgram);
-    gl.deleteFramebuffer(this.pickFramebuffer);
-    gl.deleteRenderbuffer(this.pickColor);
-    gl.deleteRenderbuffer(this.pickDepth);
     delete this.canvas.dataset.gpuRenderer;
   }
 }
