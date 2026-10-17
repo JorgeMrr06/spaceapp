@@ -336,11 +336,13 @@ describe("Memory atlas search-only experience", () => {
     const mountsBefore3D = graphLifecycle.mounted.mock.calls.length;
     const unmountsBefore3D = graphLifecycle.unmounted.mock.calls.length;
     fireEvent.click(screen.getByRole("button", { name: "Toggle 3D memory view" }));
+    expect(document.querySelector(".memory-graph-layout")?.getAttribute("data-raw-node-count")).toBe("0");
     await screen.findByTestId("memory-graph-3d");
     await waitFor(() => expect(screen.queryByTestId("memory-graph-renderer")).toBeNull());
     expect(graphLifecycle.unmounted.mock.calls.length).toBeGreaterThan(unmountsBefore3D);
 
     fireEvent.click(screen.getByRole("button", { name: "Toggle 3D memory view" }));
+    expect(document.querySelector(".memory-graph-layout")?.getAttribute("data-raw-node-count")).toBe("0");
     await screen.findByTestId("memory-graph-renderer");
     expect(graphLifecycle.mounted.mock.calls.length).toBeGreaterThan(mountsBefore3D);
   });
