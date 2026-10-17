@@ -310,6 +310,7 @@ export function MemoryGraph3D({ nodes, edges, positions, coordinates, showTitles
         const index = benchmarkPickDurations.length;
         const x = width * (0.2 + (index % 5) * 0.15);
         const y = height * (0.25 + (index % 4) * 0.16);
+        cameraRef.current.yaw += 0.004;
         renderer.pick(x, y, cameraRef.current, scale);
         benchmarkPickDurations.push(renderer.lastPickDurationMs);
         if (benchmarkPickDurations.length >= 20) {

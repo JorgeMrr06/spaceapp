@@ -10,7 +10,11 @@ export const memoryMonthLabel = (month: string) => new Date(`${month}-01T00:00:0
 
 export const MIN_ATLAS_TAG_COUNT = 10;
 
-function createLargeAtlasWithoutTopics(nodes: MemoryGraphNode[], edges: MemoryGraphEdge[]) {
+function createLargeAtlasWithoutTopics(inputNodes: MemoryGraphNode[], inputEdges: MemoryGraphEdge[]) {
+  let nodes = inputNodes.filter(node => node.type === "MEMORY" || node.type === "SOURCE" || node.type === "ROOM");
+  if (!nodes.length) nodes = inputNodes;
+  const visibleIds = new Set(nodes.map(node => node.id));
+  const edges = inputEdges.filter(edge => visibleIds.has(edge.source) && visibleIds.has(edge.target));
   const monthCounts = new Map<string, number>();
   const monthById = new Map<string, string>();
   for (const node of nodes) {

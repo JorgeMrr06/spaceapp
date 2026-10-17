@@ -255,9 +255,7 @@ export class MemoryGraphWebGLRenderer {
   private edgeNodeIndices = new Uint32Array();
   private nodeCount = 0;
   private focusIndex = -1;
-  private pickDirty = true;
-  private pickPixels = new Uint8Array(4);
-  private pickView = [Number.NaN, Number.NaN, Number.NaN, Number.NaN];
+  private readonly pickPixels = new Uint8Array(4);
   private cssWidth = 1;
   private cssHeight = 1;
   private dpr = 1;
@@ -339,7 +337,6 @@ export class MemoryGraphWebGLRenderer {
     const pixelHeight = Math.max(1, Math.round(height * this.dpr));
     if (this.canvas.width !== pixelWidth) this.canvas.width = pixelWidth;
     if (this.canvas.height !== pixelHeight) this.canvas.height = pixelHeight;
-    if (this.pickPixels.length !== pixelWidth * pixelHeight * 4) this.pickPixels = new Uint8Array(pixelWidth * pixelHeight * 4);
     gl.bindRenderbuffer(gl.RENDERBUFFER, this.pickColor);
     gl.renderbufferStorage(gl.RENDERBUFFER, gl.RGBA8, pixelWidth, pixelHeight);
     gl.bindRenderbuffer(gl.RENDERBUFFER, this.pickDepth);
@@ -348,7 +345,6 @@ export class MemoryGraphWebGLRenderer {
     gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, this.pickColor);
     gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, this.pickDepth);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    this.pickDirty = true;
   }
 
   setGraph(nodes: MemoryGraphNode[], edges: MemoryGraphEdge[], positions: Map<string, MemoryAtlasPosition>, coordinates: Map<string, MemoryPoint3D>) {
@@ -475,7 +471,6 @@ export class MemoryGraphWebGLRenderer {
       gl.bindBuffer(gl.ARRAY_BUFFER, chunk.positionBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, this.edgePositions.subarray(firstEdge * 6, lastEdge * 6), gl.DYNAMIC_DRAW);
     });
-    this.pickDirty = true;
     this.lastCoordinateUploadDurationMs = performance.now() - started;
   }
 
@@ -506,11 +501,6 @@ export class MemoryGraphWebGLRenderer {
 
   render(camera: MemoryCamera3D, scale: number, synchronize = false, layer: "all" | "edges" | "nodes" = "all") {
     const gl = this.gl;
-    const view = [camera.yaw, camera.pitch, camera.zoom, scale];
-    if (view.some((value, index) => value !== this.pickView[index])) {
-      this.pickDirty = true;
-      this.pickView = view;
-    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.clearColor(0, 0, 0, 0);
@@ -559,24 +549,23 @@ export class MemoryGraphWebGLRenderer {
     const gl = this.gl;
     const pixelX = Math.max(0, Math.min(this.canvas.width - 1, Math.floor(x * this.dpr)));
     const pixelY = Math.max(0, Math.min(this.canvas.height - 1, this.canvas.height - Math.floor(y * this.dpr) - 1));
-    if (this.pickDirty) {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.pickFramebuffer);
-      gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-      gl.enable(gl.DEPTH_TEST);
-      gl.disable(gl.BLEND);
-      gl.clearColor(0, 0, 0, 0);
-      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-      this.uniforms(this.pickProgram, camera, scale);
-      gl.bindVertexArray(this.nodeVao);
-      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.nodeCount);
-      gl.readPixels(0, 0, this.canvas.width, this.canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, this.pickPixels);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      this.pickDirty = false;
-    }
-    const offset = (pixelY * this.canvas.width + pixelX) * 4;
-    const color = this.pickPixels.subarray(offset, offset + 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.pickFramebuffer);
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.enable(gl.SCISSOR_TEST);
+    gl.scissor(pixelX, pixelY, 1, 1);
+    gl.enable(gl.DEPTH_TEST);
+    gl.disable(gl.BLEND);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    this.uniforms(this.pickProgram, camera, scale);
+    gl.bindVertexArray(this.nodeVao);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.nodeCount);
+    gl.readPixels(pixelX, pixelY, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, this.pickPixels);
+    gl.bindVertexArray(null);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     this.lastPickDurationMs = performance.now() - started;
-    const index = decodeMemoryGraphPickColor(color);
+    const index = decodeMemoryGraphPickColor(this.pickPixels);
     return index === null ? null : this.nodeIds[index] ?? null;
   }
 

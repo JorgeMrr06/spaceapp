@@ -732,7 +732,8 @@ export class DemoStore {
   private async memoryGraph(query: DemoMemoryGraphQuery = {}): Promise<MemoryGraphPayload> {
     const fixtureGraph = this.fixture.memoryWorkspace.graph;
     let base = fixtureGraph;
-    if (query.limit && query.limit > fixtureGraph.nodes.length && !query.q) {
+    const syntheticRequested = typeof window !== "undefined" && new URLSearchParams(window.location.search).has("memoryGraphSize");
+    if (syntheticRequested && query.limit && query.limit > fixtureGraph.nodes.length && !query.q) {
       let pending = this.syntheticMemoryGraphs.get(query.limit);
       if (!pending) {
         pending = syntheticMemoryGraph(fixtureGraph, query.limit);
